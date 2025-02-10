@@ -2,6 +2,7 @@
 using Dapper;
 using Microsoft.Data.SqlClient;
 using System;
+using System.Collections;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
@@ -42,21 +43,12 @@ namespace Ashpro.ORM.Dapper
             try
             {
                 sCon = sCon ?? DBConnection.Connection;
-                using (SqlConnection con = new SqlConnection(sCon))
+                using (IDbConnection db = new SqlConnection(sCon))
                 {
-                    using (SqlCommand cmd = new SqlCommand(Query, con))
-                    {
-                        await con.OpenAsync();
-                        var result = await cmd.ExecuteScalarAsync();
-                        if (result != System.DBNull.Value)
-                        {
-                            return result;
-                        }
-                        else
-                        {
-                            return null;
-                        }
-                    }
+                    if (db.State == ConnectionState.Closed) db.Open();
+
+                    return await db.QueryFirstOrDefaultAsync<dynamic>(Query);
+
                 }
             }
             catch (Exception ex)
@@ -66,26 +58,24 @@ namespace Ashpro.ORM.Dapper
         }
         public static async Task<DataTable> GetDataTableAsync(string Query, string sCon = null)
         {
-            try
+            sCon = sCon ?? DBConnection.Connection;
+
+            using (var connection = new SqlConnection(sCon))
             {
-                sCon = sCon ?? DBConnection.Connection;
-                DataTable dt = new DataTable();
-                using (SqlConnection con = new SqlConnection(sCon))
+                if (connection.State == ConnectionState.Closed)
+                    await connection.OpenAsync();
+
+                try
                 {
-                    using (SqlCommand cmd = new SqlCommand(Query, con))
-                    {
-                        await con.OpenAsync();
-                        using (SqlDataAdapter sdr = new SqlDataAdapter(cmd))
-                        {
-                            sdr.Fill(dt);
-                        }
-                    }
+                    var dataTable = new DataTable();
+                    var reader = await connection.ExecuteReaderAsync(Query);
+                    dataTable.Load(reader);
+                    return dataTable;
                 }
-                return dt;
-            }
-            catch (Exception ex)
-            {
-                throw ex;
+                catch (Exception ex)
+                {
+                    throw new Exception("Query execution failed", ex);
+                }
             }
         }
         public static async Task<T> GetAsync<T>(string Query, string sCon = null) where T : new()
@@ -127,8 +117,7 @@ namespace Ashpro.ORM.Dapper
                 sCon = sCon ?? DBConnection.Connection;
                 using (SqlConnection conn = new SqlConnection(sCon))
                 {
-                    var data = await conn.QueryAsync<string>(Query);
-                    return data.ToList();
+                    return (await conn.QueryAsync<string>(Query)).AsList();
                 }
             }
             catch (Exception ex)
@@ -138,15 +127,21 @@ namespace Ashpro.ORM.Dapper
         }
         public static async Task<bool> DatabaseMethodAsync(string Query, string sCon = null)
         {
+            if (string.IsNullOrWhiteSpace(Query))
+                return false;
+
+            sCon = sCon ?? DBConnection.Connection;
+
             try
             {
-                if (Query == string.Empty) { return false; }
-                sCon = sCon ?? DBConnection.Connection;
-                using (SqlConnection con = new SqlConnection(sCon))
+                using (var connection = new SqlConnection(sCon))
                 {
-                    var data = await con.ExecuteAsync(Query);
+                    if (connection.State == System.Data.ConnectionState.Closed)
+                        await connection.OpenAsync();
+
+                    int rowsAffected = await connection.ExecuteAsync(Query);
+                    return rowsAffected > 0;
                 }
-                return true;
             }
             catch (Exception)
             {
@@ -170,69 +165,113 @@ namespace Ashpro.ORM.Dapper
                 throw ex;
             }
         }
-        public static async Task<bool> InsertAsync(object data, string table, string sCon = null)
+        public static async Task<bool> InsertAsync2(List<object> datas, string table, string sCon = null)
         {
-            try
+            if (datas == null || !datas.Any() || string.IsNullOrWhiteSpace(table))
+                return false;
+
+            sCon = sCon ?? DBConnection.Connection;
+
+            using (var connection = new SqlConnection(sCon))
             {
-                sCon = sCon ?? DBConnection.Connection;
-                var values = new List<string>();
-                using (SqlConnection con = new SqlConnection(sCon))
+                if (connection.State == System.Data.ConnectionState.Closed)
+                    await connection.OpenAsync();
+
+                try
                 {
-                    foreach (var item in data.GetType().GetProperties())
-                    {
-                        if (item.GetValue(data, null) != null)
-                        {
-                            if (item.PropertyType.Name == "Nullable`1" && item.GetValue(data, null).ToString() == "0")
-                            {
-                                continue;
-                            }
-                            values.Add(item.Name);
-                        }
-                    }
-                    string Query = await getInsertCommandAsync(table, values);
-                    var param = new DynamicParameters();
-                    DapperLoad(data, param);
-                    var result = await con.ExecuteAsync(Query, param);
+                    var properties = datas.First().GetType().GetProperties()
+                        .Where(p => p.GetValue(datas.First()) != null)
+                        .ToList();
+
+                    var columnNames = string.Join(", ", properties.Select(p => $"[{p.Name}]"));
+                    var paramNames = string.Join(", ", properties.Select(p => $"@{p.Name}"));
+
+                    string query = $"INSERT INTO {table} ({columnNames}) VALUES ({paramNames})";
+
+                    int result = await connection.ExecuteAsync(query, datas);
+                    return result > 0;
                 }
-                return true;
-            }
-            catch (Exception ex)
-            {
-                throw ex;
+                catch (Exception ex)
+                {
+                    throw new Exception("Bulk insert operation failed", ex);
+                }
             }
         }
-        public static async Task<bool> UpdateAsync(object data, string table, string column, int iValue, string sCon = null)
+        public static async Task<bool> InsertAsync(object data, string table, string sCon = null)
         {
-            try
+            if (data == null || string.IsNullOrWhiteSpace(table))
+                return false;
+            sCon = sCon ?? DBConnection.Connection;
+            using (var connection = new SqlConnection(sCon))
             {
-                sCon = sCon ?? DBConnection.Connection;
-                var values = new List<string>();
-                using (SqlConnection con = new SqlConnection(sCon))
-                {
-                    foreach (var item in data.GetType().GetProperties())
-                    {
-                        if (item.GetValue(data, null) != null && item.Name != column)
-                        {
-                            if (item.PropertyType.Name == "Nullable`1" && item.GetValue(data, null).ToString() == "0")
-                            {
-                                continue;
-                            }
-                            values.Add(item.Name);
-                        }
-                    }
-                    string Query = await getUpdateCommandAsync(table, values, column, iValue);
-                    var param = new DynamicParameters();
-                    DapperLoad(data, param);
-                    param.Add("@" + column, iValue);
-                    var result = await con.ExecuteAsync(Query, param);
-                }
-                return true;
-            }
-            catch (Exception ex)
-            {
-                throw ex;
-            }
+                if (connection.State == System.Data.ConnectionState.Closed)
+                    await connection.OpenAsync();
 
+                try
+                {
+                    var properties = data.GetType().GetProperties()
+                        .Where(p => p.GetValue(data) != null && !(p.PropertyType.IsGenericType && p.PropertyType.GetGenericTypeDefinition() == typeof(Nullable<>) && p.GetValue(data).ToString() == "0"))
+                        .ToList();
+
+                    var columnNames = string.Join(", ", properties.Select(p => $"[{p.Name}]"));
+                    var paramNames = string.Join(", ", properties.Select(p => $"@{p.Name}"));
+
+                    string query = $"INSERT INTO {table} ({columnNames}) VALUES ({paramNames})";
+
+                    var parameters = new DynamicParameters();
+                    foreach (var prop in properties)
+                    {
+                        parameters.Add($"@{prop.Name}", prop.GetValue(data));
+                    }
+
+                    int result = await connection.ExecuteAsync(query, parameters);
+                    return result > 0;
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception("Insert operation failed", ex);
+                }
+            }
+        }
+        public static async Task<bool> UpdateAsync(object data, string table, string keyColumn, int keyValue, string sCon = null)
+        {
+            if (data == null || string.IsNullOrWhiteSpace(table) || string.IsNullOrWhiteSpace(keyColumn))
+                return false;
+
+            sCon = sCon ?? DBConnection.Connection;
+
+            using (var connection = new SqlConnection(sCon))
+            {
+                if (connection.State == System.Data.ConnectionState.Closed)
+                    await connection.OpenAsync();
+
+                try
+                {
+                    var properties = data.GetType().GetProperties()
+                        .Where(p => p.GetValue(data) != null && p.Name != keyColumn)
+                        .ToList();
+
+                    if (!properties.Any())
+                        return false;
+
+                    var updateColumns = string.Join(", ", properties.Select(p => $"[{p.Name}] = @{p.Name}"));
+                    string query = $"UPDATE {table} SET {updateColumns} WHERE [{keyColumn}] = @{keyColumn}";
+
+                    var parameters = new DynamicParameters();
+                    foreach (var prop in properties)
+                    {
+                        parameters.Add($"@{prop.Name}", prop.GetValue(data));
+                    }
+                    parameters.Add($"@{keyColumn}", keyValue);
+
+                    int result = await connection.ExecuteAsync(query, parameters);
+                    return result > 0;
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception("Update operation failed", ex);
+                }
+            }
         }
         public static async Task<bool> UpdateAsync(List<object> datas, string table, string column, string sCon = null)
         {
@@ -259,24 +298,64 @@ namespace Ashpro.ORM.Dapper
                 throw ex;
             }
         }
+        public static async Task<bool> UpdateAsync2(List<object> datas, string table, string keyColumn, string sCon = null)
+        {
+            if (datas == null || !datas.Any() || string.IsNullOrWhiteSpace(table) || string.IsNullOrWhiteSpace(keyColumn))
+                return false;
+
+            sCon = sCon ?? DBConnection.Connection;
+
+            using (var connection = new SqlConnection(sCon))
+            {
+                if (connection.State == System.Data.ConnectionState.Closed)
+                    await connection.OpenAsync();
+
+                try
+                {
+                    var properties = datas.First().GetType().GetProperties()
+                        .Where(p => p.Name != keyColumn)
+                        .ToList();
+
+                    if (!properties.Any())
+                        return false;
+
+                    var updateColumns = string.Join(", ", properties.Select(p => $"[{p.Name}] = @{p.Name}"));
+                    string query = $"UPDATE {table} SET {updateColumns} WHERE [{keyColumn}] = @{keyColumn}";
+
+                    int result = await connection.ExecuteAsync(query, datas);
+                    return result > 0;
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception("Bulk update operation failed", ex);
+                }
+            }
+        }
         public static async Task<bool> DeleteAsync(string table, string column, int iValue, string sCon = null)
         {
-            try
-            {
+            if (string.IsNullOrWhiteSpace(table) || string.IsNullOrWhiteSpace(column))
+                return false;
 
-                using (SqlConnection con = new SqlConnection(sCon))
-                {
-                    sCon = sCon ?? DBConnection.Connection;
-                    string Query = "Delete From  " + table + " Where " + column + " = @" + column + "";
-                    var param = new DynamicParameters();
-                    param.Add("@" + column, iValue);
-                    var result = await con.ExecuteAsync(Query, param);
-                }
-                return true;
-            }
-            catch (Exception ex)
+            sCon = sCon ?? DBConnection.Connection;
+
+            using (var connection = new SqlConnection(sCon))
             {
-                throw ex;
+                if (connection.State == System.Data.ConnectionState.Closed)
+                    await connection.OpenAsync();
+
+                try
+                {
+                    string query = $"DELETE FROM [{table}] WHERE [{column}] = @{column}";
+                    var parameters = new DynamicParameters();
+                    parameters.Add($"@{column}", iValue);
+
+                    int result = await connection.ExecuteAsync(query, parameters);
+                    return result > 0;
+                }
+                catch (Exception ex)
+                {
+                    throw new Exception("Delete operation failed", ex);
+                }
             }
         }
         public static async Task<bool> DeleteAsync(string Query, string sCon = null) => await DatabaseMethodAsync(Query, sCon);
